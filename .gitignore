@@ -12,3 +12,4 @@
 !/scripts/ 
 !/config/ 
 *.py[cod]
+__pycache__/
