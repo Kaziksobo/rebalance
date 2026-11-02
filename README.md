@@ -13,10 +13,10 @@ Initial set-up.
 Requires [uv](https://docs.astral.sh/uv/).
 
 ```powershell
-git clone <repo-url>
-cd <folder>
+git clone https://github.com/Kaziksobo/rebalance.git
+cd rebalance
 uv sync --locked
-Copy-Item .env.example .env   # then add your TfL API key
+cp .env.example .env   # then add TfL API key
 ```
 
 Before committing, run (in this order):
@@ -42,5 +42,3 @@ Contains:
 
 - OS data © Crown copyright and database rights 2016
 - Geomni UK Map data © and database rights [2019]
-
-## Project structure
