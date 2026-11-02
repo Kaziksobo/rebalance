@@ -1,0 +1,62 @@
+[project]
+name = "rebalance"
+version = "0.1.0"
+description = "Calculating the cost-service trade-off of overnight rebalancing."
+readme = "README.md"
+authors = [
+    { name = "Kazik Sobotnicki", email = "Kaziksobo@outlook.com" }
+]
+requires-python = ">=3.13"
+classifiers = ["Private :: Do Not Upload"] # guard against accidental PyPI upload
+dependencies = []
+
+[project.scripts]
+rebalance = "rebalance:main"
+
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+    "ty>=0.0.95",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "F",    # pycodestyle errors, pyflakes
+    "I",         # import sorting
+    "B", "UP",   # likely bugs, modern syntax
+    "RUF",       # ruff-specific checks
+    "DTZ",       # naive datetimes: logger stamps UTC, trip files use clock times
+    "N",         # naming
+    "ANN",       # annotations required (ty has no strict mode to enforce them)
+    "D",         # docstrings (google convention below)
+    "PT",        # pytest style
+    "C90",       # complexity (limit below)
+    "SIM", "PTH",  # simplifications, pathlib over os.path
+    "T20",       # no stray print (scripts exempt below)
+]
+ignore = ["N803", "N806"]  # uppercase X-style names are normal in ML code
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ANN"]           # tests don't need docstrings or annotations
+"scripts/**" = ["D", "ANN", "T20"]  # throwaway checks may print and skip annotations
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"       # strict = true needs pytest 9
+testpaths = ["tests"]
+addopts = "-ra"          # short summary of skipped and xfailed tests
+strict = true            # unknown markers or config keys fail instead of passing silently
+filterwarnings = ["error"]  # warnings fail tests; add narrow ignores as libraries need them
