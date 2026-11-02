@@ -1,0 +1,13 @@
+/* 
+!/.gitignore 
+!/.gitattributes
+!/.python-version 
+!/pyproject.toml 
+!/uv.lock 
+!/README.md 
+!/.env.example 
+!/src/ 
+!/tests/ 
+!/scripts/ 
+!/config/ 
+*.py[cod]
