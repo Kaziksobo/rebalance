@@ -22,6 +22,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.3",
     "ty>=0.0.95",
 ]
@@ -60,8 +61,18 @@ max-complexity = 15
 include = ["src", "tests"]
 
 [tool.pytest.ini_options]
-minversion = "9.0"       # strict = true needs pytest 9
+minversion = "9.0"
 testpaths = ["tests"]
-addopts = "-ra"          # short summary of skipped and xfailed tests
-strict = true            # unknown markers or config keys fail instead of passing silently
-filterwarnings = ["error"]  # warnings fail tests; add narrow ignores as libraries need them
+addopts = "-ra --cov --cov-branch --cov-report=term --cov-report=xml"
+strict = true
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["rebalance"]   # measure the package, not the tests
+
+[tool.coverage.report]
+show_missing = true      # print the line numbers that never ran
+skip_covered = true      # list only files with gaps, to keep the output short
+exclude_also = [
+    "if __name__ == .__main__.:",
+]
