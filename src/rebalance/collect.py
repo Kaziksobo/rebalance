@@ -3,9 +3,11 @@
 Will run on the Raspberry Pi
 """
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -17,6 +19,9 @@ DEFAULT_REQUEST_TIMEOUT_S = 10.0
 DEFAULT_DEADLINE_S = 30.0
 
 _SETTING_NAMES = ("TFL_APP_KEY", "REBALANCE_DATA_DIR")
+
+CLOCK_FLOOR = datetime(2026, 1, 1, tzinfo=UTC).timestamp()
+CLOCK_TOLERANCE_S = 60.0
 
 
 class ConfigError(Exception):
@@ -188,3 +193,56 @@ def load_settings(
         data_dir=data_dir,
         interval_s=interval_s,
     )
+
+
+def first_tick(now: float, interval_s: float) -> float:
+    """Return the first tick time at or after ``now``, on the interval grid.
+
+    Args:
+        now: Current time, epoch seconds.
+        interval_s: Seconds between ticks.
+
+    Returns:
+        Absolute epoch time of the first grid point at or after ``now``.
+
+    Raises:
+        ValueError: If ``interval_s`` is not positive.
+    """
+    if interval_s <= 0:
+        raise ValueError("interval must be positive")
+
+    count = math.ceil((now - 0) / interval_s)
+    return count * interval_s
+
+
+def next_tick(previous: float, interval_s: float, now: float) -> float:
+    """Return the first scheduled tick strictly after ``now``.
+
+    Ticks lie on ``previous + k * interval_s``. Missed ticks are skipped,
+    never returned, so a long sleep produces one tick, not a burst.
+
+    Raises:
+        ValueError: If ``interval_s`` is not positive.
+    """
+    if interval_s <= 0:
+        raise ValueError("interval must be positive")
+    elapsed = now - previous
+    # A clock that went backwards still returns `previous + interval_s`,
+    # never an earlier time.
+    k = max(math.floor(elapsed / interval_s) + 1, 1)
+    result = previous + k * interval_s
+    if result <= now:
+        result += interval_s
+    return result
+
+
+def clock_plausible(now: float, last_record: float | None) -> bool:
+    """Return True if the system clock looks sane.
+
+    The clock must not be before CLOCK_FLOOR, and must not be earlier than
+    the last record by more than CLOCK_TOLERANCE_S. A clock far *ahead* of the
+    last record is normal after an outage and is accepted.
+    """
+    if now < CLOCK_FLOOR:
+        return False
+    return not (last_record is not None and now < last_record - CLOCK_TOLERANCE_S)
