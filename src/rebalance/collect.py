@@ -3,12 +3,15 @@
 Will run on the Raspberry Pi
 """
 
+import gzip
+import json
 import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 MASK = "***"
@@ -22,6 +25,12 @@ _SETTING_NAMES = ("TFL_APP_KEY", "REBALANCE_DATA_DIR")
 
 CLOCK_FLOOR = datetime(2026, 1, 1, tzinfo=UTC).timestamp()
 CLOCK_TOLERANCE_S = 60.0
+
+SCHEMA_VERSION = 1
+
+
+class DeadlineExceededError(Exception):
+    """Raised when one request runs past its total deadline."""
 
 
 class ConfigError(Exception):
@@ -246,3 +255,107 @@ def clock_plausible(now: float, last_record: float | None) -> bool:
     if now < CLOCK_FLOOR:
         return False
     return not (last_record is not None and now < last_record - CLOCK_TOLERANCE_S)
+
+
+def error_class(exc: BaseException) -> str:
+    """Map an exception to a label for logging and metrics.
+
+    The mapping is as follows:
+    1. HTTPError first (it subclasses URLError)      -> f"http_{exc.code}"
+    2. DeadlineExceededError                          -> "deadline"
+    3. TimeoutError                                   -> "timeout"
+    4. URLError: if isinstance(exc.reason, TimeoutError) -> "timeout", else "network"
+    5. any other OSError                              -> "network"
+    6. everything else                                -> type(exc).__name__
+
+    Args:
+        exc (BaseException): The exception to map.
+
+    Returns:
+        str: The label for the exception.
+    """
+    if isinstance(exc, HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, DeadlineExceededError):
+        return "deadline"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, URLError):
+        if isinstance(exc.reason, TimeoutError):
+            return "timeout"
+        return "network"
+    if isinstance(exc, OSError):
+        return "network"
+    return type(exc).__name__
+
+
+def looks_like_json(body: str) -> bool:
+    """Check if a string looks like JSON.
+
+    Args:
+        body (str): The string to check.
+
+    Returns:
+        bool: True if the string looks like JSON, False otherwise.
+    """
+    text = body.strip()
+    return text.startswith("[") and text.endswith("]")
+
+
+def build_record(
+    fetched_at: float,
+    status: int | None,
+    elapsed_ms: int,
+    error: str | None,
+    body: str | None,
+) -> dict[str, object]:
+    """Build a record dictionary for logging.
+
+    Args:
+        fetched_at (float): The timestamp when the data was fetched.
+        status (int | None): The HTTP status code of the response.
+        elapsed_ms (int): The elapsed time in milliseconds for the request.
+        error (str | None): The error label, if any.
+        body (str | None): The response body, if any.
+
+    Returns:
+        dict[str, object]: The record dictionary.
+    """
+    iso = datetime.fromtimestamp(fetched_at, UTC).isoformat(timespec="milliseconds")
+    iso = iso.replace("+00:00", "Z")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "fetched_at": iso,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "error": error,
+        "payload_ok": body is not None and looks_like_json(body),
+        "payload": body,
+    }
+
+
+def encode_member(record: Mapping[str, object]) -> bytes:
+    """Encode a record as a single line of JSON, then compress with gzip.
+
+    Args:
+        record (Mapping[str, object]): The record to encode.
+
+    Returns:
+        bytes: The gzip-compressed JSON line.
+    """
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    return gzip.compress(line.encode("utf-8"), mtime=0)
+
+
+def day_path(base: Path, fetched_at: float) -> Path:
+    """Return the path to the day's file for the given timestamp.
+
+    Args:
+        base (Path): The base directory for the data.
+        fetched_at (float): The timestamp to determine the day.
+
+    Returns:
+        Path: The path to the day's file.
+    """
+    date = datetime.fromtimestamp(fetched_at, UTC).strftime("%Y-%m-%d")
+    return base / f"{date}.jsonl.gz"
