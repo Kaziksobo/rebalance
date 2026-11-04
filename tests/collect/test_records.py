@@ -2,6 +2,7 @@ import gzip
 import json
 from datetime import UTC, datetime
 from email.message import Message
+from http.client import IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 
@@ -42,6 +43,7 @@ def ts(
         pytest.param(ConnectionResetError(), "network", id="connection_reset"),
         pytest.param(DeadlineExceededError(), "deadline", id="deadline"),
         pytest.param(ValueError("x"), "ValueError", id="other_uses_type_name"),
+        pytest.param(IncompleteRead(b""), "network", id="incomplete_read"),
     ],
 )
 def test_error_class_maps_exception_to_label(exc: BaseException, expected: str) -> None:

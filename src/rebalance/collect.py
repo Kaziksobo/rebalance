@@ -7,12 +7,15 @@ import gzip
 import json
 import math
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from http.client import HTTPException, IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 MASK = "***"
 _APP_KEY_VALUE = re.compile(r"(app_key=)[^&\s'\"),]*", re.IGNORECASE)
@@ -28,6 +31,27 @@ CLOCK_TOLERANCE_S = 60.0
 
 SCHEMA_VERSION = 1
 
+USER_AGENT = "rebalance-logger/0.1 (student project)"
+CHUNK_SIZE = 64 * 1024
+MAX_ERROR_BODY = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    """Outcome of one request. Never contains the URL or the key.
+
+    Attributes:
+        status: HTTP status if a response started, otherwise None.
+        body: Response text, or None if no usable body.
+        error: Error label from error_class, or None on success.
+        elapsed_ms: Wall time of the request in milliseconds.
+    """
+
+    status: int | None
+    body: str | None
+    error: str | None
+    elapsed_ms: int
+
 
 class DeadlineExceededError(Exception):
     """Raised when one request runs past its total deadline."""
@@ -35,6 +59,10 @@ class DeadlineExceededError(Exception):
 
 class ConfigError(Exception):
     """Raised for bad configuration. Messages must never contain values."""
+
+
+class IncompleteReadError(Exception):
+    """Raised when a response body is shorter than the Content-Length header."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +314,8 @@ def error_class(exc: BaseException) -> str:
         return "network"
     if isinstance(exc, OSError):
         return "network"
+    if isinstance(exc, (OSError, HTTPException)):
+        return "network"
     return type(exc).__name__
 
 
@@ -359,3 +389,62 @@ def day_path(base: Path, fetched_at: float) -> Path:
     """
     date = datetime.fromtimestamp(fetched_at, UTC).strftime("%Y-%m-%d")
     return base / f"{date}.jsonl.gz"
+
+
+def fetch(
+    url: str,
+    *,
+    timeout_s: float,
+    deadline_s: float,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> FetchResult:
+    """Fetch a URL, never raising for expected failures.
+
+    Args:
+        url: Full URL, including any key. Never logged or returned.
+        timeout_s: Timeout for each blocking socket operation.
+        deadline_s: Total time allowed, checked on a monotonic clock.
+        monotonic: Clock function, injectable for tests.
+
+    Returns:
+        A FetchResult describing the outcome.
+    """
+    start: float = monotonic()
+    status: int | None = None
+    try:
+        request = Request(url, headers={"User-Agent": USER_AGENT})
+        with urlopen(request, timeout=timeout_s) as response:
+            status = response.status
+            expected: str | None = response.headers.get("Content-Length")
+            chunks: list[bytes] = []
+            while True:
+                chunk: bytes = response.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if monotonic() - start > deadline_s:
+                    raise DeadlineExceededError()
+            data: bytes = b"".join(chunks)
+            if expected is not None and len(data) != int(expected):
+                raise IncompleteRead(data, int(expected))
+        return FetchResult(
+            status,
+            data.decode("utf-8", errors="replace"),
+            None,
+            int((monotonic() - start) * 1000),
+        )
+    except HTTPError as exc:
+        try:
+            body_bytes: bytes = exc.read(MAX_ERROR_BODY)
+        except Exception:
+            body_bytes = b""
+        finally:
+            exc.close()
+        body: str = redact(body_bytes.decode("utf-8", errors="replace"), "")
+        return FetchResult(
+            exc.code, body, error_class(exc), int((monotonic() - start) * 1000)
+        )
+    except Exception as exc:
+        return FetchResult(
+            status, None, error_class(exc), int((monotonic() - start) * 1000)
+        )
