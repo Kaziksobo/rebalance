@@ -1,6 +1,22 @@
-"""Logger file for calling TfL API and collecting live data.
+"""Single-file logger for the TfL BikePoint live feed.
 
-Will run on the Raspberry Pi
+Polls the API once a minute and appends each response, unchanged, to a gzipped
+JSON-lines file for that UTC day. The payload is stored raw on purpose: what
+matters is decided later in analysis, not at collection time.
+
+Constraints that shape this file:
+    * Standard library only, and nothing imported from the rebalance package.
+      It is copied to a Raspberry Pi on its own and run with the system Python.
+    * The API key travels in the request URL, so no URL or exception text may
+      ever be logged or stored (see redact() and fetch()).
+    * It runs unattended. A failed poll is recorded and the loop carries on;
+      only another running instance, an implausible clock or a full disk stop it.
+
+Layout: constants, settings, pure helpers (redaction, ticks, records,
+encoding), I/O (fetch, files, lock), then the poll loop and entry point.
+
+Exit codes: 0 clean stop, 1 runtime failure, 2 configuration error,
+3 another instance is already running.
 """
 
 import gzip
@@ -17,40 +33,39 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+# --- Constants and exceptions ---
+
 MASK = "***"
+# Masks the value of any app_key parameter, even one that isn't the key we hold,
+# so a stale or wrong key can't leak either. The value ends at &, whitespace,
+# a quote, a bracket or a comma.
 _APP_KEY_VALUE = re.compile(r"(app_key=)[^&\s'\"),]*", re.IGNORECASE)
 
+
+# The per-operation timeout bounds each blocking socket call; the deadline bounds
+# the whole request. urllib's timeout alone doesn't cap total time, so both are needed.
 DEFAULT_INTERVAL_S = 60.0
 DEFAULT_REQUEST_TIMEOUT_S = 10.0
 DEFAULT_DEADLINE_S = 30.0
 
+# The only two settings the logger reads; anything else in .env is ignored.
 _SETTING_NAMES = ("TFL_APP_KEY", "REBALANCE_DATA_DIR")
 
+# A Pi has no real-time clock: before NTP syncs, the time can be wildly wrong.
+# Anything earlier than this means the clock hasn't synced.
 CLOCK_FLOOR = datetime(2026, 1, 1, tzinfo=UTC).timestamp()
-CLOCK_TOLERANCE_S = 60.0
+CLOCK_TOLERANCE_S = 60.0  # Allows small backwards steps from NTP corrections.
 
+# Bump when the record format changes, so old day files stay interpretable.
 SCHEMA_VERSION = 1
 
+# TfL's front end returned 403 for urllib's default agent, so an explicit one is needed.
 USER_AGENT = "rebalance-logger/0.1 (student project)"
+
+# 64 KiB: small enough to check the deadline often, large enough to be efficient on a
+# slow CPU. Error bodies are diagnostic only, so cap what we keep.
 CHUNK_SIZE = 64 * 1024
 MAX_ERROR_BODY = 64 * 1024
-
-
-@dataclass(frozen=True, slots=True)
-class FetchResult:
-    """Outcome of one request. Never contains the URL or the key.
-
-    Attributes:
-        status: HTTP status if a response started, otherwise None.
-        body: Response text, or None if no usable body.
-        error: Error label from error_class, or None on success.
-        elapsed_ms: Wall time of the request in milliseconds.
-    """
-
-    status: int | None
-    body: str | None
-    error: str | None
-    elapsed_ms: int
 
 
 class DeadlineExceededError(Exception):
@@ -61,8 +76,11 @@ class ConfigError(Exception):
     """Raised for bad configuration. Messages must never contain values."""
 
 
-class IncompleteReadError(Exception):
-    """Raised when a response body is shorter than the Content-Length header."""
+class AlreadyRunningError(Exception):
+    """Raised when another logger instance holds the lock."""
+
+
+# --- Settings ---
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +94,12 @@ class Settings:
         request_timeout_s: Timeout for each blocking socket operation.
         deadline_s: Total time allowed for one request, checked on a
             monotonic clock.
+
+    Raises:
+        ConfigError: If key is missing or blank, or there is a non-positive interval.
     """
 
+    # repr=False keeps the key out of any printed or logged Settings.
     api_key: str = field(repr=False)
     data_dir: Path
     interval_s: float = DEFAULT_INTERVAL_S
@@ -112,56 +134,6 @@ class Settings:
     def log_path(self) -> Path:
         """Path of the logger's own log."""
         return self.live_dir / "logger.log"
-
-
-def redact(text: str, key: str) -> str:
-    """Redact the given key from the text.
-
-    Args:
-        text: The text to redact the key from.
-        key: The key to redact.
-
-    Returns:
-        The text with the key redacted.
-    """
-    if key:
-        for form in (quote(key, safe=""), key):
-            text = text.replace(form, MASK)
-    return _APP_KEY_VALUE.sub(rf"\1{MASK}", text)
-
-
-def parse_env_file(text: str) -> dict[str, str]:
-    """Parse a .env file into a dictionary.
-
-    Skips empty lines and comments.
-    Splits on the first '=' to allow values with '=' in them.
-    Inline comments are not stripped, so values can contain '#' if needed.
-
-    Args:
-        text: The text of the .env file.
-
-    Returns:
-        A dictionary of key-value pairs.
-
-    Raises:
-        ConfigError: If a line is invalid (does not contain '=').
-    """
-    env_dict: dict[str, str] = {}
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise ConfigError(f"Invalid line {line_number} in .env file")
-        # Split on the first '=' to allow values with '=' in them
-        key, value = line.split("=", 1)
-        # strip whitespace around key and value
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        env_dict[key] = value
-    return env_dict
 
 
 def find_env_file(start: Path, max_levels: int = 4) -> Path | None:
@@ -208,20 +180,21 @@ def load_settings(
 
     Returns:
         Settings: The loaded settings.
-
-    Raises:
-        ConfigError: If key is missing or blank, or there is a non-positive interval.
     """
     env_file_path = find_env_file(search_from)
     file_vars: dict[str, str] = {}
     if env_file_path:
+        # utf-8-sig drops the byte-order mark some Windows editors add.
         file_text = env_file_path.read_text(encoding="utf-8-sig")
         file_vars = parse_env_file(file_text)
 
+    # Environment beats the file; an empty environment value counts as unset.
     values = {
         name: environ.get(name) or file_vars.get(name, "") for name in _SETTING_NAMES
     }
 
+    # A relative data_dir is anchored to the .env's folder, never the working directory,
+    # which differs under systemd and Task Scheduler.
     base_dir = env_file_path.parent if env_file_path else search_from
     data_dir = (base_dir / (values["REBALANCE_DATA_DIR"] or "data")).resolve()
 
@@ -232,6 +205,63 @@ def load_settings(
     )
 
 
+def parse_env_file(text: str) -> dict[str, str]:
+    """Parse a .env file into a dictionary.
+
+    Skips empty lines and comments.
+    Splits on the first '=' to allow values with '=' in them.
+    Inline comments are not stripped, so values can contain '#' if needed.
+
+    Args:
+        text: The text of the .env file.
+
+    Returns:
+        A dictionary of key-value pairs.
+
+    Raises:
+        ConfigError: If a line is invalid (does not contain '=').
+    """
+    env_dict: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ConfigError(f"Invalid line {line_number} in .env file")
+        # Split on the first '=' to allow values with '=' in them
+        key, value = line.split("=", 1)
+        # strip whitespace around key and value
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        env_dict[key] = value
+    return env_dict
+
+
+# --- Redaction ---
+def redact(text: str, key: str) -> str:
+    """Redact the given key from the text.
+
+    Encoded form: a key with reserved characters appears URL-encoded inside URLs.
+    An empty key is skipped, since replacing "" would insert the mask between
+    every character.
+
+    Args:
+        text: The text to redact the key from.
+        key: The key to redact.
+
+    Returns:
+        The text with the key redacted.
+    """
+    if key:
+        for form in (quote(key, safe=""), key):
+            text = text.replace(form, MASK)
+    # Safety net: mask any app_key value, whatever it is.
+    return _APP_KEY_VALUE.sub(rf"\1{MASK}", text)
+
+
+# --- Scheduling ---
 def first_tick(now: float, interval_s: float) -> float:
     """Return the first tick time at or after ``now``, on the interval grid.
 
@@ -245,10 +275,11 @@ def first_tick(now: float, interval_s: float) -> float:
     Raises:
         ValueError: If ``interval_s`` is not positive.
     """
+    # The grid is anchored at the epoch, so a 60 s interval ticks on whole minutes.
     if interval_s <= 0:
         raise ValueError("interval must be positive")
 
-    count = math.ceil((now - 0) / interval_s)
+    count = math.ceil(now / interval_s)
     return count * interval_s
 
 
@@ -266,6 +297,7 @@ def next_tick(previous: float, interval_s: float, now: float) -> float:
     elapsed = now - previous
     # A clock that went backwards still returns `previous + interval_s`,
     # never an earlier time.
+    # +1 makes the result strictly after now; the guard below covers float rounding.
     k = max(math.floor(elapsed / interval_s) + 1, 1)
     result = previous + k * interval_s
     if result <= now:
@@ -285,6 +317,7 @@ def clock_plausible(now: float, last_record: float | None) -> bool:
     return not (last_record is not None and now < last_record - CLOCK_TOLERANCE_S)
 
 
+# --- Records and encoding ---
 def error_class(exc: BaseException) -> str:
     """Map an exception to a label for logging and metrics.
 
@@ -302,6 +335,7 @@ def error_class(exc: BaseException) -> str:
     Returns:
         str: The label for the exception.
     """
+    # HTTPError subclasses URLError and OSError, so it must be checked first.
     if isinstance(exc, HTTPError):
         return f"http_{exc.code}"
     if isinstance(exc, DeadlineExceededError):
@@ -312,8 +346,7 @@ def error_class(exc: BaseException) -> str:
         if isinstance(exc.reason, TimeoutError):
             return "timeout"
         return "network"
-    if isinstance(exc, OSError):
-        return "network"
+    # IncompleteRead comes from http.client and isn't an OSError.
     if isinstance(exc, (OSError, HTTPException)):
         return "network"
     return type(exc).__name__
@@ -353,6 +386,9 @@ def build_record(
     """
     iso = datetime.fromtimestamp(fetched_at, UTC).isoformat(timespec="milliseconds")
     iso = iso.replace("+00:00", "Z")
+    # payload is the raw response text, never parsed: parsing 2 MB each minute is slow
+    # on the Pi, and raw text is guaranteed untouched.
+    # payload_ok is only a cheap shape check.
     return {
         "schema_version": SCHEMA_VERSION,
         "fetched_at": iso,
@@ -373,6 +409,9 @@ def encode_member(record: Mapping[str, object]) -> bytes:
     Returns:
         bytes: The gzip-compressed JSON line.
     """
+    # One JSON object per line, compressed as its own gzip member. Members concatenate
+    # into a valid gzip stream, so appending is safe and a crash costs at most the last
+    # poll. mtime=0 makes the output deterministic.
     line = json.dumps(record, separators=(",", ":")) + "\n"
     return gzip.compress(line.encode("utf-8"), mtime=0)
 
@@ -391,6 +430,24 @@ def day_path(base: Path, fetched_at: float) -> Path:
     return base / f"{date}.jsonl.gz"
 
 
+# --- Fetching ---
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    """Outcome of one request. Never contains the URL or the key.
+
+    Attributes:
+        status: HTTP status if a response started, otherwise None.
+        body: Response text, or None if no usable body.
+        error: Error label from error_class, or None on success.
+        elapsed_ms: Wall time of the request in milliseconds.
+    """
+
+    status: int | None
+    body: str | None
+    error: str | None
+    elapsed_ms: int
+
+
 def fetch(
     url: str,
     *,
@@ -399,6 +456,8 @@ def fetch(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> FetchResult:
     """Fetch a URL, never raising for expected failures.
+
+    Failures are returned as an error label, never raised.
 
     Args:
         url: Full URL, including any key. Never logged or returned.
@@ -422,8 +481,12 @@ def fetch(
                 if not chunk:
                     break
                 chunks.append(chunk)
+                # urllib's timeout only covers each socket call,
+                # so check total elapsed after every chunk.
                 if monotonic() - start > deadline_s:
                     raise DeadlineExceededError()
+            # read(n) returns short without raising if the connection closes early,
+            # so compare against Content-Length ourselves.
             data: bytes = b"".join(chunks)
             if expected is not None and len(data) != int(expected):
                 raise IncompleteRead(data, int(expected))
@@ -434,6 +497,8 @@ def fetch(
             int((monotonic() - start) * 1000),
         )
     except HTTPError as exc:
+        # Error pages can echo the request URL, key included, so the
+        # body is redacted before it is stored.
         try:
             body_bytes: bytes = exc.read(MAX_ERROR_BODY)
         except Exception:
