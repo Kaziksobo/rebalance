@@ -22,13 +22,18 @@ Exit codes: 0 clean stop, 1 runtime failure, 2 configuration error,
 import gzip
 import json
 import math
+import os
 import re
+import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http.client import HTTPException, IncompleteRead
+from json import JSONDecodeError
 from pathlib import Path
+from typing import BinaryIO, TypedDict, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -510,6 +515,210 @@ def fetch(
             exc.code, body, error_class(exc), int((monotonic() - start) * 1000)
         )
     except Exception as exc:
+        # Last resort, so no failure can end the loop. Only the label is recorded,
+        # never str(exc), which can contain the URL.
         return FetchResult(
             status, None, error_class(exc), int((monotonic() - start) * 1000)
         )
+
+
+# --- Files and locking ---
+def append_member(path: Path, data: bytes) -> None:
+    """Write a gzip member to the given file, creating it if needed.
+
+    One call is one whole member; flushed and fsynced; a crash leaves at
+    most one partial member; raises OSError
+
+    Args:
+        path (Path): The path to the file to append to.
+        data (bytes): The gzip-compressed data to append.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+class Status(TypedDict):
+    """The shape of the status file the logger writes.
+
+    Last success and last attempt are epoch seconds, or None if never.
+    """
+
+    last_success: float | None
+    last_attempt: float
+    successes: int
+    failures: int
+    consecutive_failures: int
+
+
+def _count(value: object) -> int:
+    """Return ``value`` if it is a real integer, else 0 (a damaged file)."""
+    # bool is a subclass of int, so exclude it explicitly.
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _timestamp(value: object) -> float | None:
+    """Return ``value`` as a float if it is a real number, else None."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def update_status(
+    previous: Mapping[str, object] | None, ok: bool, now: float
+) -> Status:
+    """Return a new status after one poll; ``previous`` is never modified.
+
+    Returns a new dict, never modifies previous; missing or damaged values count as
+    zero, so a corrupt status file can't stop the logger at start-up.
+
+    Args:
+        previous (Mapping[str, object] | None): The previous status, or None if there is
+                                                no previous status.
+        ok (bool): Whether the last poll was successful.
+        now (float): The current timestamp.
+
+    Returns:
+        Status: The new status dictionary.
+    """
+    base = previous or {}
+    return {
+        "last_success": now if ok else _timestamp(base.get("last_success")),
+        "last_attempt": now,
+        "successes": _count(base.get("successes")) + (1 if ok else 0),
+        "failures": _count(base.get("failures")) + (0 if ok else 1),
+        "consecutive_failures": 0
+        if ok
+        else _count(base.get("consecutive_failures")) + 1,
+    }
+
+
+def read_status(path: Path) -> dict[str, object] | None:
+    """Read the status file and return its contents as a dictionary.
+
+    If the file does not exist or is not valid JSON, return None.
+    An advisory file; returns None for anything unusable.
+
+    Args:
+        path (Path): Path to the status file.
+
+    Returns:
+        dict[str, object] | None: The status dictionary if the file exists and is valid
+                                  JSON, return None if the file is missing, unreadable,
+                                  not valid JSON, or not a JSON object.
+    """
+    try:
+        text: str = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    try:
+        data: object = json.loads(text)
+    except JSONDecodeError:
+        return None
+
+    if isinstance(data, dict):
+        return cast("dict[str, object]", data)
+    return None
+
+
+def write_status(path: Path, status: Mapping[str, object]) -> None:
+    """Write the status dictionary to the given file as JSON.
+
+    Atomic: temp file then rename, so a reader never sees a half-written file
+
+    Args:
+        path (Path): Path to the status file.
+        status (Mapping[str, object]): The status dictionary to write to the file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Same folder as the target: rename is only atomic within one filesystem
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(status), encoding="utf-8")
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _try_lock(handle: BinaryIO) -> None:
+    """Take an exclusive, non-blocking lock; raise OSError if it is held.
+
+    Windows: lock one byte at offset 0. Locks there are mandatory, so we never write
+    into the locked region.
+
+    Linux: flock attaches the lock to the open file, so a second acquire in the same
+    process also fails.
+
+    Args:
+        handle (BinaryIO): _description_
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        # Windows frees a closed or dead process's locks only after an unspecified delay
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:  # pragma: no cover (Linux: exercised on the Pi)
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(handle: BinaryIO) -> None:
+    """Release the lock on the given file handle.
+
+    Windows: unlock one byte at offset 0.
+
+    Linux: flock releases the lock on the open file.
+
+    Args:
+        handle (BinaryIO): _description_
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        # Windows frees a closed or dead process's locks only after an unspecified delay
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:  # pragma: no cover
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextmanager
+def acquire_lock(path: Path) -> Generator[None]:
+    """Acquire an exclusive lock on the given path.
+
+    The lock is advisory: it only prevents other instances of this logger from running
+    at the same time. It does not prevent other processes from writing to the file.
+
+    Args:
+        path (Path): Path to the lock file.
+
+    Raises:
+        AlreadyRunningError: If another instance holds the lock.
+
+    Yields:
+        Generator[None]: yields control to the caller while the lock is held.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("ab")
+    # Only unlock a lock we actually took
+    locked = False
+    try:
+        try:
+            _try_lock(handle)
+            locked = True
+        except OSError as exc:
+            raise AlreadyRunningError("another instance holds the lock") from exc
+        yield
+    # The lock is released when the context exits, even if an exception occurs.
+    finally:
+        if locked:
+            _unlock(handle)
+        handle.close()
