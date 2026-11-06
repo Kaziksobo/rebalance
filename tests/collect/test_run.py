@@ -241,3 +241,27 @@ def test_run_re_anchors_when_the_clock_steps_backwards_mid_run(
         BASE + 60,
         BASE + 540,
     ]  # re-anchored to the next whole minute
+
+
+def test_run_logs_recovery_after_failures(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = FakeTime(BASE + 17.5)
+    poller = Poller(fake, [False, False, True])
+
+    with caplog.at_level(logging.INFO):
+        run(make_settings(), wait=fake.wait, clock=fake.clock, poll=poller)
+
+    assert "recovered after 2 failed polls" in caplog.text
+
+
+def test_run_does_not_log_recovery_without_failures(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = FakeTime(BASE + 17.5)
+    poller = Poller(fake, [True, True])
+
+    with caplog.at_level(logging.INFO):
+        run(make_settings(), wait=fake.wait, clock=fake.clock, poll=poller)
+
+    assert "recovered" not in caplog.text

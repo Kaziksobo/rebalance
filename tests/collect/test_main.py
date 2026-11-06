@@ -223,3 +223,47 @@ def test_main_signal_handler_requests_stop(tmp_path: Path) -> None:
     )
 
     assert results == [True]
+
+
+@pytest.mark.parametrize("code", [EXIT_OK, EXIT_RUNTIME])
+def test_main_logs_the_runners_exit_code_when_the_loop_stops(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], code: int
+) -> None:
+    main(
+        [],
+        environ=env(tmp_path),
+        search_from=tmp_path,
+        runner=FakeRunner(code=code),
+        poll=FakePoll(),
+    )
+
+    assert f"stopped with exit code {code}" in capsys.readouterr().err
+
+
+def test_main_once_does_not_log_a_stopped_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        ["--once"],
+        environ=env(tmp_path),
+        search_from=tmp_path,
+        runner=FakeRunner(),
+        poll=FakePoll(),
+    )
+
+    assert "stopped with exit code" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("result", "word"), [(True, "ok"), (False, "failed")])
+def test_main_once_logs_the_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], result: bool, word: str
+) -> None:
+    main(
+        ["--once"],
+        environ=env(tmp_path),
+        search_from=tmp_path,
+        runner=FakeRunner(),
+        poll=FakePoll(result),
+    )
+
+    assert f"single poll: {word}" in capsys.readouterr().err

@@ -1,5 +1,6 @@
 import gzip
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -211,3 +212,78 @@ def test_poll_once_default_append_writes_a_readable_day_file(
     day_file = settings.live_dir / "2027-01-15.jsonl.gz"
     lines = gzip.decompress(day_file.read_bytes()).splitlines()
     assert [json.loads(line)["payload"] for line in lines] == ["[1]"]
+
+
+def test_poll_once_failure_logs_label_and_status_but_no_url(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        poll_once(
+            make_settings(api_key=KEY),
+            now=lambda: T,
+            fetch_fn=fake_fetch(FetchResult(403, "<html>No</html>", "http_403", 5)),
+            append=Appends(),
+        )
+
+    assert "poll failed: http_403 (status 403)" in caplog.text
+    assert KEY not in caplog.text
+
+
+def test_poll_once_request_failure_without_status_logs_none(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        poll_once(
+            make_settings(api_key=KEY),
+            now=lambda: T,
+            fetch_fn=fake_fetch(FetchResult(None, None, "timeout", 30_000)),
+            append=Appends(),
+        )
+
+    assert "poll failed: timeout (status None)" in caplog.text
+
+
+def test_poll_once_bad_payload_is_logged_as_bad_payload(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        poll_once(
+            make_settings(api_key=KEY),
+            now=lambda: T,
+            fetch_fn=fake_fetch(FetchResult(200, "<html>oops</html>", None, 5)),
+            append=Appends(),
+        )
+
+    assert "poll failed: bad_payload (status 200)" in caplog.text
+    assert "oops" not in caplog.text  # the body is never logged
+
+
+def test_poll_once_success_logs_nothing(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        poll_once(
+            make_settings(api_key=KEY),
+            now=lambda: T,
+            fetch_fn=fake_fetch(FetchResult(200, "[1]", None, 5)),
+            append=Appends(),
+        )
+
+    assert caplog.text == ""
+
+
+def test_poll_once_logs_to_the_logger_it_is_given(
+    make_settings: Callable[..., Settings], caplog: pytest.LogCaptureFixture
+) -> None:
+    custom = logging.getLogger("tests.custom")
+
+    with caplog.at_level(logging.INFO):
+        poll_once(
+            make_settings(api_key=KEY),
+            now=lambda: T,
+            fetch_fn=fake_fetch(FetchResult(None, None, "network", 5)),
+            append=Appends(),
+            log=custom,
+        )
+
+    assert [r.name for r in caplog.records] == ["tests.custom"]

@@ -826,6 +826,7 @@ def poll_once(
     now: Callable[[], float] = time.time,
     fetch_fn: Callable[..., FetchResult] = fetch,
     append: Callable[[Path, bytes], None] = append_member,
+    log: logging.Logger | None = None,
 ) -> bool:
     """Poll the API once and always append a record, success or failure.
 
@@ -839,6 +840,8 @@ def poll_once(
             Defaults to fetch.
         append (Callable[[Path, bytes], None], optional): Data append function.
             Defaults to append_member.
+        log (logging.Logger | None, optional): Logger for warnings.
+            Defaults to the module's logger.
 
     Returns:
         bool: True if the request succeeded and the payload looks like a JSON
@@ -858,7 +861,13 @@ def poll_once(
         fetched_at, result.status, result.elapsed_ms, result.error, result.body
     )
     append(day_path(settings.live_dir, fetched_at), encode_member(record))
-    return result.error is None and bool(record["payload_ok"])
+    ok = result.error is None and bool(record["payload_ok"])
+    if not ok:
+        log = log or logging.getLogger("rebalance.collect")
+        log.warning(
+            "poll failed: %s (status %s)", result.error or "bad_payload", result.status
+        )
+    return ok
 
 
 def _wait_for_plausible_clock(
@@ -943,7 +952,10 @@ def run(
                 log.warning("poll failed: %s", error_class(exc))
                 ok = False
 
+            failed_before = _count(status.get("consecutive_failures"))
             status = update_status(status, ok, now)
+            if ok and failed_before:
+                log.info("recovered after %d failed polls", failed_before)
             last_attempt = now
             try:
                 write_status(settings.status_path, status)
@@ -1024,16 +1036,20 @@ def main(
     try:
         log.info("starting")
         if args.once:
-            # So a manual poll can't race the running service
+            # So a manual poll can't race the running service.
             with acquire_lock(settings.lock_path):
-                return EXIT_OK if poll(settings) else EXIT_RUNTIME
-        return runner(settings, wait=stop.wait, poll=poll)
+                ok = poll(settings)
+                log.info("single poll: %s", "ok" if ok else "failed")
+                return EXIT_OK if ok else EXIT_RUNTIME
+        code = runner(settings, wait=stop.wait, poll=poll)
+        log.info("stopped with exit code %d", code)
+        return code
     except AlreadyRunningError as exc:
         log.error("%s", exc)  # fixed text, no values
         return EXIT_RUNNING
     finally:
         for sig, handler in previous.items():
-            signal.signal(sig, handler)  # leave no handlers behind (tests!)
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
