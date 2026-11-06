@@ -52,7 +52,6 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 # --- Constants and exceptions ---
-
 MASK = "***"
 # Masks the value of any app_key parameter, even one that isn't the key we hold,
 # so a stale or wrong key can't leak either. The value ends at &, whitespace,
@@ -60,9 +59,9 @@ MASK = "***"
 _APP_KEY_VALUE = re.compile(r"(app_key=)[^&\s'\"),]*", re.IGNORECASE)
 
 
+DEFAULT_INTERVAL_S = 60.0
 # The per-operation timeout bounds each blocking socket call; the deadline bounds
 # the whole request. urllib's timeout alone doesn't cap total time, so both are needed.
-DEFAULT_INTERVAL_S = 60.0
 DEFAULT_REQUEST_TIMEOUT_S = 10.0
 DEFAULT_DEADLINE_S = 30.0
 
@@ -86,6 +85,27 @@ CHUNK_SIZE = 64 * 1024
 MAX_ERROR_BODY = 64 * 1024
 
 
+API_URL = "https://api.tfl.gov.uk/BikePoint"
+# Clock recheck interval: if the clock is implausible, wait this long and check again.
+CLOCK_RECHECK_S = 30.0
+# Exit codes: 0 clean stop, 1 runtime failure, 2 configuration error,
+# 3 another instance is already running.
+EXIT_OK, EXIT_RUNTIME, EXIT_CONFIG, EXIT_RUNNING = 0, 1, 2, 3
+
+
+class DeadlineExceededError(Exception):
+    """Raised when one request runs past its total deadline."""
+
+
+class ConfigError(Exception):
+    """Raised for bad configuration. Messages must never contain values."""
+
+
+class AlreadyRunningError(Exception):
+    """Raised when another logger instance holds the lock."""
+
+
+# --- Settings ---
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Everything the logger needs to run, resolved once at start-up.
@@ -139,32 +159,6 @@ class Settings:
         return self.live_dir / "logger.log"
 
 
-API_URL = "https://api.tfl.gov.uk/BikePoint"
-# Clock recheck interval: if the clock is implausible, wait this long and check again.
-CLOCK_RECHECK_S = 30.0
-# Exit codes: 0 clean stop, 1 runtime failure, 2 configuration error,
-# 3 another instance is already running.
-EXIT_OK, EXIT_RUNTIME, EXIT_CONFIG, EXIT_RUNNING = 0, 1, 2, 3
-
-# Polling function type: takes Settings, returns True on success, False on failure.
-PollFn = Callable[[Settings], bool]
-
-
-class DeadlineExceededError(Exception):
-    """Raised when one request runs past its total deadline."""
-
-
-class ConfigError(Exception):
-    """Raised for bad configuration. Messages must never contain values."""
-
-
-class AlreadyRunningError(Exception):
-    """Raised when another logger instance holds the lock."""
-
-
-# --- Settings ---
-
-
 def find_env_file(start: Path, max_levels: int = 4) -> Path | None:
     """Find a .env file in the current or parent directories.
 
@@ -172,8 +166,8 @@ def find_env_file(start: Path, max_levels: int = 4) -> Path | None:
     Returns the first .env file found, or None if not found.
 
     Args:
-        start: The starting directory to search from.
-        max_levels: The maximum number of parent directories to search.
+        start (Path): The starting directory to search from.
+        max_levels (int): The maximum number of parent directories to search.
 
     Returns:
         The path to the .env file if found, otherwise None.
@@ -195,20 +189,24 @@ def load_settings(
     *,
     interval_s: float = DEFAULT_INTERVAL_S,
 ) -> Settings:
-    """Load settings from a .env file and environment variables.
+    """Resolve the settings.
 
-    Finds .env file, reads it, parses it, overrides with env vars,
-    treats empty values in env as unset so falls back to file.
-    Resolves data_dir to absolute path
+    The environment beats the .env file, and an empty environment value counts as unset.
+    A relative REBALANCE_DATA_DIR is anchored to the .env's folder
+    (or search_from if there's no file), never the working directory.
 
     Args:
         search_from (Path): The directory to start searching for a .env file.
         environ (Mapping[str, str]): The environment variables to use.
         interval_s (float, optional): The interval between polls.
-                                      Defaults to DEFAULT_INTERVAL_S.
+            Defaults to DEFAULT_INTERVAL_S.
 
     Returns:
         Settings: The loaded settings.
+
+    Raises:
+        ConfigError: If the key is missing, the interval is not positive, or the
+            .env file has an invalid line.
     """
     env_file_path = find_env_file(search_from)
     file_vars: dict[str, str] = {}
@@ -242,10 +240,10 @@ def parse_env_file(text: str) -> dict[str, str]:
     Inline comments are not stripped, so values can contain '#' if needed.
 
     Args:
-        text: The text of the .env file.
+        text (str): The text of the .env file.
 
     Returns:
-        A dictionary of key-value pairs.
+        dict[str, str]: A dictionary of key-value pairs.
 
     Raises:
         ConfigError: If a line is invalid (does not contain '=').
@@ -277,11 +275,11 @@ def redact(text: str, key: str) -> str:
     every character.
 
     Args:
-        text: The text to redact the key from.
-        key: The key to redact.
+        text (str): The text to redact the key from.
+        key (str): The key to redact.
 
     Returns:
-        The text with the key redacted.
+        str: The text with the key redacted.
     """
     if key:
         for form in (quote(key, safe=""), key):
@@ -295,19 +293,19 @@ def first_tick(now: float, interval_s: float) -> float:
     """Return the first tick time at or after ``now``, on the interval grid.
 
     Args:
-        now: Current time, epoch seconds.
-        interval_s: Seconds between ticks.
+        now (float): Current time, epoch seconds.
+        interval_s (float): Seconds between ticks.
 
     Returns:
-        Absolute epoch time of the first grid point at or after ``now``.
+        float: Absolute epoch time of the first grid point at or after ``now``.
 
     Raises:
         ValueError: If ``interval_s`` is not positive.
     """
-    # The grid is anchored at the epoch, so a 60 s interval ticks on whole minutes.
     if interval_s <= 0:
         raise ValueError("interval must be positive")
 
+    # The grid is anchored at the epoch, so a 60 s interval ticks on whole minutes.
     count = math.ceil(now / interval_s)
     return count * interval_s
 
@@ -318,17 +316,25 @@ def next_tick(previous: float, interval_s: float, now: float) -> float:
     Ticks lie on ``previous + k * interval_s``. Missed ticks are skipped,
     never returned, so a long sleep produces one tick, not a burst.
 
+    Args:
+        previous (float): The last tick time, epoch seconds.
+        interval_s (float): Seconds between ticks.
+        now (float): Current time, epoch seconds.
+
+    Returns:
+        float: Absolute epoch time of the first grid point strictly after now.
+
     Raises:
         ValueError: If ``interval_s`` is not positive.
     """
     if interval_s <= 0:
         raise ValueError("interval must be positive")
     elapsed = now - previous
-    # A clock that went backwards still returns `previous + interval_s`,
-    # never an earlier time.
-    # +1 makes the result strictly after now; the guard below covers float rounding.
+    # max(..., 1) stops a clock that went backwards returning an earlier tick.
+    # The +1 makes the result strictly after now.
     k = max(math.floor(elapsed / interval_s) + 1, 1)
     result = previous + k * interval_s
+    # Guard against float rounding putting the result at or before now.
     if result <= now:
         result += interval_s
     return result
@@ -340,6 +346,13 @@ def clock_plausible(now: float, last_record: float | None) -> bool:
     The clock must not be before CLOCK_FLOOR, and must not be earlier than
     the last record by more than CLOCK_TOLERANCE_S. A clock far *ahead* of the
     last record is normal after an outage and is accepted.
+
+    Args:
+        now (float): Current time, epoch seconds.
+        last_record (float | None): Timestamp of the last record, or None if no records.
+
+    Returns:
+        bool: True if the clock is plausible, False otherwise.
     """
     if now < CLOCK_FLOOR:
         return False
@@ -350,13 +363,7 @@ def clock_plausible(now: float, last_record: float | None) -> bool:
 def error_class(exc: BaseException) -> str:
     """Map an exception to a label for logging and metrics.
 
-    The mapping is as follows:
-    1. HTTPError first (it subclasses URLError)      -> f"http_{exc.code}"
-    2. DeadlineExceededError                          -> "deadline"
-    3. TimeoutError                                   -> "timeout"
-    4. URLError: if isinstance(exc.reason, TimeoutError) -> "timeout", else "network"
-    5. any other OSError                              -> "network"
-    6. everything else                                -> type(exc).__name__
+    Return http_<code>, deadline, timeout, network, or the exception's type name.
 
     Args:
         exc (BaseException): The exception to map.
@@ -382,13 +389,17 @@ def error_class(exc: BaseException) -> str:
 
 
 def looks_like_json(body: str) -> bool:
-    """Check if a string looks like JSON.
+    """Check that ``body`` has the shape of a JSON array.
+
+    A cheap check only: it doesn't parse, because parsing a 2 MB body each
+    minute is slow on the Pi. BikePoint returns an array, so a JSON error
+    object (which starts with ``{``) counts as not OK.
 
     Args:
-        body (str): The string to check.
+        body (str): The response text.
 
     Returns:
-        bool: True if the string looks like JSON, False otherwise.
+        bool: True if the stripped text starts with ``[`` and ends with ``]``.
     """
     text = body.strip()
     return text.startswith("[") and text.endswith("]")
@@ -403,6 +414,10 @@ def build_record(
 ) -> dict[str, object]:
     """Build a record dictionary for logging.
 
+    The payload is the raw response text, never parsed: parsing 2 MB each minute is
+    slow on the Pi, and raw text is guaranteed untouched.
+    payload_ok is only a cheap shape check.
+
     Args:
         fetched_at (float): The timestamp when the data was fetched.
         status (int | None): The HTTP status code of the response.
@@ -415,9 +430,6 @@ def build_record(
     """
     iso = datetime.fromtimestamp(fetched_at, UTC).isoformat(timespec="milliseconds")
     iso = iso.replace("+00:00", "Z")
-    # payload is the raw response text, never parsed: parsing 2 MB each minute is slow
-    # on the Pi, and raw text is guaranteed untouched.
-    # payload_ok is only a cheap shape check.
     return {
         "schema_version": SCHEMA_VERSION,
         "fetched_at": iso,
@@ -432,15 +444,16 @@ def build_record(
 def encode_member(record: Mapping[str, object]) -> bytes:
     """Encode a record as a single line of JSON, then compress with gzip.
 
+    Each record is one JSON line compressed as its own gzip member. Members concatenate
+    into a valid gzip stream, so appending is safe and a crash costs at most the last
+    poll. mtime=0 makes the output deterministic.
+
     Args:
         record (Mapping[str, object]): The record to encode.
 
     Returns:
         bytes: The gzip-compressed JSON line.
     """
-    # One JSON object per line, compressed as its own gzip member. Members concatenate
-    # into a valid gzip stream, so appending is safe and a crash costs at most the last
-    # poll. mtime=0 makes the output deterministic.
     line = json.dumps(record, separators=(",", ":")) + "\n"
     return gzip.compress(line.encode("utf-8"), mtime=0)
 
@@ -484,18 +497,16 @@ def fetch(
     deadline_s: float,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> FetchResult:
-    """Fetch a URL, never raising for expected failures.
-
-    Failures are returned as an error label, never raised.
+    """Fetch url. Expected failures are returned as an error label, never raised.
 
     Args:
-        url: Full URL, including any key. Never logged or returned.
-        timeout_s: Timeout for each blocking socket operation.
-        deadline_s: Total time allowed, checked on a monotonic clock.
-        monotonic: Clock function, injectable for tests.
+        url (str): Full URL, including any key. Never logged or returned.
+        timeout_s (float): Timeout for each blocking socket operation.
+        deadline_s (float): Total time allowed, checked on a monotonic clock.
+        monotonic (Callable[[], float]): Clock function, injectable for tests.
 
     Returns:
-        A FetchResult describing the outcome.
+        FetchResult: The outcome, any failure is in error.
     """
     start: float = monotonic()
     status: int | None = None
@@ -548,14 +559,18 @@ def fetch(
 
 # --- Files and locking ---
 def append_member(path: Path, data: bytes) -> None:
-    """Write a gzip member to the given file, creating it if needed.
+    """Append one gzip member to ``path``, durably.
 
-    One call is one whole member; flushed and fsynced; a crash leaves at
-    most one partial member; raises OSError
+    One call writes one whole member, so a crash leaves at most one partial
+    member at the end. The data is flushed and fsynced before returning: the Pi
+    will see power cuts, and a day's data can't be recreated.
 
     Args:
-        path (Path): The path to the file to append to.
-        data (bytes): The gzip-compressed data to append.
+        path (Path): The day file. Missing parent folders are created.
+        data (bytes): One complete gzip member, as produced by ``encode_member``.
+
+    Raises:
+        OSError: If the write fails, for example when the disk is full.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("ab") as handle:
@@ -595,12 +610,12 @@ def update_status(
 ) -> Status:
     """Return a new status after one poll; ``previous`` is never modified.
 
-    Returns a new dict, never modifies previous; missing or damaged values count as
-    zero, so a corrupt status file can't stop the logger at start-up.
+    Returns a new dict; missing or damaged values count as zero,
+    so a corrupt status file can't stop the logger at start-up.
 
     Args:
         previous (Mapping[str, object] | None): The previous status, or None if there is
-                                                no previous status.
+            no previous status.
         ok (bool): Whether the last poll was successful.
         now (float): The current timestamp.
 
@@ -620,18 +635,16 @@ def update_status(
 
 
 def read_status(path: Path) -> dict[str, object] | None:
-    """Read the status file and return its contents as a dictionary.
+    """Read the status file, or return None if it is unusable.
 
-    If the file does not exist or is not valid JSON, return None.
-    An advisory file; returns None for anything unusable.
+    The file is advisory, so any damage (missing, unreadable, not JSON, or not a
+    JSON object) means "no status" and never stops the logger.
 
     Args:
         path (Path): Path to the status file.
 
     Returns:
-        dict[str, object] | None: The status dictionary if the file exists and is valid
-                                  JSON, return None if the file is missing, unreadable,
-                                  not valid JSON, or not a JSON object.
+        dict[str, object] | None: The parsed status object, or None.
     """
     try:
         text: str = path.read_text(encoding="utf-8")
@@ -651,14 +664,14 @@ def read_status(path: Path) -> dict[str, object] | None:
 def write_status(path: Path, status: Mapping[str, object]) -> None:
     """Write the status dictionary to the given file as JSON.
 
-    Atomic: temp file then rename, so a reader never sees a half-written file
+    Atomic: temp file then rename, so a reader never sees a half-written file.
 
     Args:
         path (Path): Path to the status file.
         status (Mapping[str, object]): The status dictionary to write to the file.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Same folder as the target: rename is only atomic within one filesystem
+    # Same folder as the target: rename is only atomic within one filesystem.
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text(json.dumps(status), encoding="utf-8")
@@ -683,7 +696,6 @@ def _try_lock(handle: BinaryIO) -> None:
     if sys.platform == "win32":
         import msvcrt
 
-        # Windows frees a closed or dead process's locks only after an unspecified delay
         handle.seek(0)
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     else:  # pragma: no cover (Linux: exercised on the Pi)
@@ -716,23 +728,23 @@ def _unlock(handle: BinaryIO) -> None:
 
 @contextmanager
 def acquire_lock(path: Path) -> Generator[None]:
-    """Acquire an exclusive lock on the given path.
+    """Hold an exclusive lock on ``path`` for the duration of the block.
 
-    The lock is advisory: it only prevents other instances of this logger from running
-    at the same time. It does not prevent other processes from writing to the file.
+    The lock is released when the block exits, including after an error, and
+    by the OS if the process dies. The file itself holds no data.
 
     Args:
-        path (Path): Path to the lock file.
+        path (Path): The lock file. Missing parent folders are created.
 
     Raises:
-        AlreadyRunningError: If another instance holds the lock.
+        AlreadyRunningError: If another instance already holds the lock.
 
     Yields:
-        Generator[None]: yields control to the caller while the lock is held.
+        None: Control returns to the caller while the lock is held.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("ab")
-    # Only unlock a lock we actually took
+    # Only unlock a lock we actually took.
     locked = False
     try:
         try:
@@ -741,16 +753,14 @@ def acquire_lock(path: Path) -> Generator[None]:
         except OSError as exc:
             raise AlreadyRunningError("another instance holds the lock") from exc
         yield
-    # The lock is released when the context exits, even if an exception occurs.
     finally:
+        # The lock is released when the context exits, even if an exception occurs.
         if locked:
             _unlock(handle)
         handle.close()
 
 
 # --- Logging, poll loop and entry point ---
-
-
 class RedactingFormatter(logging.Formatter):
     """Format log lines in UTC, passing the finished text through ``redact``.
 
@@ -773,19 +783,19 @@ class RedactingFormatter(logging.Formatter):
 def configure_logging(
     settings: Settings, *, stream: TextIO | None = None
 ) -> logging.Logger:
-    """Configure the logging system.
+    """Send the logger's messages to a rotating file and to a stream.
 
-    This function sets up the logging system with a file handler and a stream handler.
-    The file handler writes log messages to a rotating file, while the stream handler
-    writes log messages to a stream (e.g., stderr).
+    Lines are timestamped in UTC and pass through ``redact``, so neither the
+    key nor an exception's text can leak. The file rotates at about 1 MB, keeping
+    three backups. Existing handlers are removed first, so calling this twice
+    doesn't duplicate lines.
 
     Args:
-        settings (Settings): The settings object containing configuration for logging.
-        stream (TextIO | None, optional): The stream to which log messages will be
-                                          written. Defaults to None.
+        settings (Settings): Supplies the log file path and the key to redact.
+        stream (TextIO | None, optional): Where to also write. Defaults to stderr.
 
     Returns:
-        logging.Logger: The configured logger instance.
+        logging.Logger: The configured rebalance.collect logger.
     """
     settings.live_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("rebalance.collect")
@@ -806,6 +816,10 @@ def configure_logging(
     return logger
 
 
+# Polling function type: takes Settings, returns True on success, False on failure.
+PollFn = Callable[[Settings], bool]
+
+
 def poll_once(
     settings: Settings,
     *,
@@ -813,20 +827,25 @@ def poll_once(
     fetch_fn: Callable[..., FetchResult] = fetch,
     append: Callable[[Path, bytes], None] = append_member,
 ) -> bool:
-    """Poll the API once.
+    """Poll the API once and always append a record, success or failure.
+
+    A failed request still produces a record (with an error label), so gaps in
+    the data are explicit. The record is filed by when the request started.
 
     Args:
         settings (Settings): The settings object containing configuration for the poll.
-        now (Callable[[], float], optional): The function to use to get the current
-                                             time. Defaults to time.time.
-        fetch_fn (Callable[..., FetchResult], optional): The function to use to fetch
-                                                         data. Defaults to fetch.
-        append (Callable[[Path, bytes], None], optional): The function to use to
-                                                          append data. Defaults to
-                                                          append_member.
+        now (Callable[[], float], optional): Clock function. Defaults to time.time.
+        fetch_fn (Callable[..., FetchResult], optional): Data fetch function.
+            Defaults to fetch.
+        append (Callable[[Path, bytes], None], optional): Data append function.
+            Defaults to append_member.
 
     Returns:
-        bool: True if the poll was successful, False otherwise.
+        bool: True if the request succeeded and the payload looks like a JSON
+            array; False for a failed request or a payload of the wrong shape.
+
+    Raises:
+        OSError: If the record cannot be written (for example a full disk).
     """
     # The record is filed by when the request STARTED, so read the clock first.
     fetched_at = now()
@@ -872,19 +891,20 @@ def run(
 
     Args:
         settings (Settings): The settings object containing configuration for
-                             the logger.
+            the logger.
         wait (Callable[[float], bool]): A function that takes a number of seconds to
-                                        wait and returns True if a stop was requested.
+            wait and returns True if a stop was requested.
         clock (Callable[[], float], optional): The function to use to get the current
-                                               time. Defaults to time.time.
+            time. Defaults to time.time.
         poll (PollFn, optional): The function to use for polling the API.
-                                 Defaults to poll_once.
-        log (logging.Logger | None, optional): The logger to use. Defaults to None.
+            Defaults to poll_once.
+        log (logging.Logger | None, optional): The logger to use. Defaults to the
+            modules logger.
 
     Returns:
         int: Exit code for the run:
-             EXIT_OK (0) for a clean stop (a stop was requested),
-             EXIT_RUNTIME (1) if the day file could not be written.
+            EXIT_OK (0) for a clean stop (a stop was requested),
+            EXIT_RUNTIME (1) if the day file could not be written.
 
     Raises:
         AlreadyRunningError: If another instance holds the lock. ``main`` turns
