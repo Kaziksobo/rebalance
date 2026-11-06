@@ -15,25 +15,38 @@ Constraints that shape this file:
 Layout: constants, settings, pure helpers (redaction, ticks, records,
 encoding), I/O (fetch, files, lock), then the poll loop and entry point.
 
+Usage:
+    python3 collect.py [--once] [--interval SECONDS]
+
+Settings come from the environment or a .env file: TFL_APP_KEY (required) and
+REBALANCE_DATA_DIR (default: ``data``, beside the .env). Output goes to
+<data dir>/live/: the day files (YYYY-MM-DD.jsonl.gz), .status.json, .logger.lock
+and logger.log.
+
 Exit codes: 0 clean stop, 1 runtime failure, 2 configuration error,
 3 another instance is already running.
 """
 
+import argparse
 import gzip
 import json
+import logging
 import math
 import os
 import re
+import signal
 import sys
+import threading
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http.client import HTTPException, IncompleteRead
 from json import JSONDecodeError
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import BinaryIO, TypedDict, cast
+from typing import BinaryIO, TextIO, TypedDict, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -71,21 +84,6 @@ USER_AGENT = "rebalance-logger/0.1 (student project)"
 # slow CPU. Error bodies are diagnostic only, so cap what we keep.
 CHUNK_SIZE = 64 * 1024
 MAX_ERROR_BODY = 64 * 1024
-
-
-class DeadlineExceededError(Exception):
-    """Raised when one request runs past its total deadline."""
-
-
-class ConfigError(Exception):
-    """Raised for bad configuration. Messages must never contain values."""
-
-
-class AlreadyRunningError(Exception):
-    """Raised when another logger instance holds the lock."""
-
-
-# --- Settings ---
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +137,32 @@ class Settings:
     def log_path(self) -> Path:
         """Path of the logger's own log."""
         return self.live_dir / "logger.log"
+
+
+API_URL = "https://api.tfl.gov.uk/BikePoint"
+# Clock recheck interval: if the clock is implausible, wait this long and check again.
+CLOCK_RECHECK_S = 30.0
+# Exit codes: 0 clean stop, 1 runtime failure, 2 configuration error,
+# 3 another instance is already running.
+EXIT_OK, EXIT_RUNTIME, EXIT_CONFIG, EXIT_RUNNING = 0, 1, 2, 3
+
+# Polling function type: takes Settings, returns True on success, False on failure.
+PollFn = Callable[[Settings], bool]
+
+
+class DeadlineExceededError(Exception):
+    """Raised when one request runs past its total deadline."""
+
+
+class ConfigError(Exception):
+    """Raised for bad configuration. Messages must never contain values."""
+
+
+class AlreadyRunningError(Exception):
+    """Raised when another logger instance holds the lock."""
+
+
+# --- Settings ---
 
 
 def find_env_file(start: Path, max_levels: int = 4) -> Path | None:
@@ -654,7 +678,7 @@ def _try_lock(handle: BinaryIO) -> None:
     process also fails.
 
     Args:
-        handle (BinaryIO): _description_
+        handle (BinaryIO): The file handle to lock.
     """
     if sys.platform == "win32":
         import msvcrt
@@ -676,7 +700,7 @@ def _unlock(handle: BinaryIO) -> None:
     Linux: flock releases the lock on the open file.
 
     Args:
-        handle (BinaryIO): _description_
+        handle (BinaryIO): The file handle to unlock.
     """
     if sys.platform == "win32":
         import msvcrt
@@ -722,3 +746,275 @@ def acquire_lock(path: Path) -> Generator[None]:
         if locked:
             _unlock(handle)
         handle.close()
+
+
+# --- Logging, poll loop and entry point ---
+
+
+class RedactingFormatter(logging.Formatter):
+    """Format log lines in UTC, passing the finished text through ``redact``.
+
+    Redacting after formatting covers everything: the message, its arguments
+    and any traceback text.
+    """
+
+    converter = staticmethod(time.gmtime)
+
+    def __init__(self, key: str) -> None:
+        """Initialize the formatter with a redaction key."""
+        super().__init__("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%SZ")
+        self._key = key
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format a log record, redacting the key from the output."""
+        return redact(super().format(record), self._key)
+
+
+def configure_logging(
+    settings: Settings, *, stream: TextIO | None = None
+) -> logging.Logger:
+    """Configure the logging system.
+
+    This function sets up the logging system with a file handler and a stream handler.
+    The file handler writes log messages to a rotating file, while the stream handler
+    writes log messages to a stream (e.g., stderr).
+
+    Args:
+        settings (Settings): The settings object containing configuration for logging.
+        stream (TextIO | None, optional): The stream to which log messages will be
+                                          written. Defaults to None.
+
+    Returns:
+        logging.Logger: The configured logger instance.
+    """
+    settings.live_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("rebalance.collect")
+    # Clear old handlers so a second call doesn't duplicate every line.
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    formatter = RedactingFormatter(settings.api_key)
+    file_handler = RotatingFileHandler(
+        settings.log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    stream_handler = logging.StreamHandler(stream)  # None means stderr
+    for handler in (file_handler, stream_handler):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+def poll_once(
+    settings: Settings,
+    *,
+    now: Callable[[], float] = time.time,
+    fetch_fn: Callable[..., FetchResult] = fetch,
+    append: Callable[[Path, bytes], None] = append_member,
+) -> bool:
+    """Poll the API once.
+
+    Args:
+        settings (Settings): The settings object containing configuration for the poll.
+        now (Callable[[], float], optional): The function to use to get the current
+                                             time. Defaults to time.time.
+        fetch_fn (Callable[..., FetchResult], optional): The function to use to fetch
+                                                         data. Defaults to fetch.
+        append (Callable[[Path, bytes], None], optional): The function to use to
+                                                          append data. Defaults to
+                                                          append_member.
+
+    Returns:
+        bool: True if the poll was successful, False otherwise.
+    """
+    # The record is filed by when the request STARTED, so read the clock first.
+    fetched_at = now()
+    # The only place a URL is built. It must never be logged or stored.
+    url = f"{API_URL}?app_key={settings.api_key}"
+    result = fetch_fn(
+        url, timeout_s=settings.request_timeout_s, deadline_s=settings.deadline_s
+    )
+    record = build_record(
+        fetched_at, result.status, result.elapsed_ms, result.error, result.body
+    )
+    append(day_path(settings.live_dir, fetched_at), encode_member(record))
+    return result.error is None and bool(record["payload_ok"])
+
+
+def _wait_for_plausible_clock(
+    clock: Callable[[], float],
+    wait: Callable[[float], bool],
+    last_attempt: float | None,
+    log: logging.Logger,
+) -> bool:
+    """Wait until the clock looks sane. Return True if a stop was requested."""
+    while not clock_plausible(clock(), last_attempt):
+        log.warning("system clock not plausible; waiting %.0f s", CLOCK_RECHECK_S)
+        if wait(CLOCK_RECHECK_S):
+            return True
+    return False
+
+
+def run(
+    settings: Settings,
+    *,
+    wait: Callable[[float], bool],
+    clock: Callable[[], float] = time.time,
+    poll: PollFn = poll_once,
+    log: logging.Logger | None = None,
+) -> int:
+    """Run the collection loop until a stop is requested.
+
+    Polls on the interval grid, records each outcome in the status file, and
+    waits for a plausible clock before starting. A failed poll never ends the
+    loop; only a stop request, a held lock or a failing disk do.
+
+    Args:
+        settings (Settings): The settings object containing configuration for
+                             the logger.
+        wait (Callable[[float], bool]): A function that takes a number of seconds to
+                                        wait and returns True if a stop was requested.
+        clock (Callable[[], float], optional): The function to use to get the current
+                                               time. Defaults to time.time.
+        poll (PollFn, optional): The function to use for polling the API.
+                                 Defaults to poll_once.
+        log (logging.Logger | None, optional): The logger to use. Defaults to None.
+
+    Returns:
+        int: Exit code for the run:
+             EXIT_OK (0) for a clean stop (a stop was requested),
+             EXIT_RUNTIME (1) if the day file could not be written.
+
+    Raises:
+        AlreadyRunningError: If another instance holds the lock. ``main`` turns
+            this into EXIT_RUNNING.
+    """
+    log = log or logging.getLogger("rebalance.collect")
+    with acquire_lock(settings.lock_path):
+        status: Mapping[str, object] = read_status(settings.status_path) or {}
+        last_attempt = _timestamp(status.get("last_attempt"))
+
+        if _wait_for_plausible_clock(clock, wait, last_attempt, log):
+            return EXIT_OK
+        tick = first_tick(clock(), settings.interval_s)
+
+        while True:
+            if wait(tick - clock()):  # sleeps until the tick; True means stop
+                return EXIT_OK
+            now = clock()
+            if not clock_plausible(now, last_attempt):
+                # The clock moved backwards (e.g. an NTP correction): re-anchor.
+                if _wait_for_plausible_clock(clock, wait, last_attempt, log):
+                    return EXIT_OK
+                tick = first_tick(clock(), settings.interval_s)
+                continue
+
+            try:
+                ok = poll(settings)
+            except OSError as exc:
+                # The only OSError source is the day-file write: a full or failing disk.
+                # Stop loudly; systemd restarts us.
+                log.error("fatal: %s writing the day file", type(exc).__name__)
+                return EXIT_RUNTIME
+            except Exception as exc:
+                # Last resort so one bad poll can't end the loop. Log only the label:
+                # str(exc) and tracebacks can contain the URL.
+                log.warning("poll failed: %s", error_class(exc))
+                ok = False
+
+            status = update_status(status, ok, now)
+            last_attempt = now
+            try:
+                write_status(settings.status_path, status)
+            except OSError as exc:
+                log.warning("could not write status: %s", type(exc).__name__)
+            # Skips ticks missed during a slow poll, so there is no catch-up burst.
+            tick = next_tick(tick, settings.interval_s, clock())
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    search_from: Path | None = None,
+    runner: Callable[..., int] = run,
+    poll: PollFn = poll_once,
+) -> int:
+    """Run the logger from the command line.
+
+    Parses the flags, loads the settings, sets up logging, installs handlers so
+    SIGINT and SIGTERM request a clean stop, then either polls once (``--once``)
+    or runs the loop. The previous signal handlers are restored on the way out.
+
+    The last four arguments are injection points for tests; production calls
+    ``main()`` with none of them.
+
+    Args:
+        argv (Sequence[str] | None, optional): Command-line arguments, without
+            the program name. Defaults to ``sys.argv[1:]``.
+        environ (Mapping[str, str], optional): Environment variables to read
+            settings from. Defaults to ``os.environ``.
+        search_from (Path | None, optional): Folder to start searching upwards
+            for a ``.env`` file. Defaults to this file's folder.
+        runner (Callable[..., int], optional): The loop to run. Defaults to ``run``.
+        poll (PollFn, optional): The single-poll function, used by ``--once`` and
+            passed to the runner. Defaults to ``poll_once``.
+
+    Returns:
+        int: The process exit code:
+            EXIT_OK (0) for a clean stop, or a successful ``--once`` poll,
+            EXIT_RUNTIME (1) for a failed ``--once`` poll or a failing disk,
+            EXIT_CONFIG (2) for a configuration error,
+            EXIT_RUNNING (3) if another instance is already running.
+
+    Raises:
+        SystemExit: If a flag can't be parsed (``argparse`` exits with status 2).
+    """
+    parser = argparse.ArgumentParser(description="TfL BikePoint live-feed logger")
+    parser.add_argument("--once", action="store_true", help="poll once and exit")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL_S,
+        help="seconds between polls",
+    )
+    args = parser.parse_args(argv)  # bad input exits with status 2 by itself
+
+    try:
+        settings = load_settings(
+            search_from or Path(__file__).resolve().parent,
+            environ,
+            interval_s=args.interval,
+        )
+    except ConfigError as exc:
+        sys.stderr.write(f"configuration error: {exc}\n")  # messages hold no values
+        return EXIT_CONFIG
+
+    log = configure_logging(settings)
+    stop = threading.Event()
+
+    def request_stop(signum: int, frame: object) -> None:
+        """Handlers must be quick: just set the flag and let the loop shut down."""
+        stop.set()
+
+    previous = {
+        sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        log.info("starting")
+        if args.once:
+            # So a manual poll can't race the running service
+            with acquire_lock(settings.lock_path):
+                return EXIT_OK if poll(settings) else EXIT_RUNTIME
+        return runner(settings, wait=stop.wait, poll=poll)
+    except AlreadyRunningError as exc:
+        log.error("%s", exc)  # fixed text, no values
+        return EXIT_RUNNING
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)  # leave no handlers behind (tests!)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
